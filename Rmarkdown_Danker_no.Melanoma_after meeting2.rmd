@@ -1,0 +1,660 @@
+---
+title: "Danker's Data Analysis"
+author: "Ali Nehme"
+date: "`r format(Sys.time(), '%B %d, %Y %H:%M:%S', 'America/Chicago', T)`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: 
+          collapsed: false
+          smooth_scroll: false
+    number_sections: true
+    theme: united
+    #highlight: tango
+    code_folding: show
+    
+  
+---
+
+```{r setup, include=TRUE, cache=F}
+# eset.noMelanoma
+knitr::opts_chunk$set(
+	echo = TRUE,
+	error = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(limma)
+library(ggthemes)
+library(ggrepel)
+library(ade4)
+library(factoextra)
+library(UpSetR)
+library(tidyverse)
+library(enrichR)
+library(DT)
+library(tidyr)
+library(tibble)
+library(gridExtra)
+library(grid)
+library(clusterProfiler)
+#library(annotate)
+#library(org.Hs.eg.db)
+library(msigdbr)
+library(ggplot2)
+library(RColorBrewer)
+library(enrichplot)
+library(reshape2)
+library(ggpubr)
+library(pheatmap)
+library(ggbeeswarm)
+library(GSVA)
+library(psych)
+library(Biobase)
+#library(GSEABase)
+
+#conflicted::conflict_prefer("select", "dplyr")
+
+options(DT.options = list(extensions = c("Buttons" , "FixedColumns"),
+                          autoWidth = TRUE , 
+                           pageLength = 10,
+                           searchHighlight = TRUE,
+                           buttons = c('copy', 'txt', 'print'),
+                           scrollX = F,
+                          class = c('compact cell-border stripe hover'),
+                          rownames = F, filter = 'top') )
+
+```
+
+
+# Data preparation
+```{r Data preparation, message=FALSE, include=TRUE}
+
+
+## original name: CountMatrix_Q3.Norm.txt
+counts = read.table('./data/IN/Normalized_CountMatrix_Q3.Norm.txt', 
+                    header=T, sep='\t',row.names=1)
+data.scale=scale(log2(counts))
+log2.data=log2(counts)
+
+
+## Original name: pData.txt this should have LOX_relative_expression
+pData = read.table("./data/IN/samples_description.txt", row.names=1, header =T)
+
+pData$ROI = factor(pData$ROI)
+pData= subset(pData, rownames(pData)%in%colnames(counts))
+
+if(!all.equal(colnames(counts), rownames(pData))){
+  print("Error: colnames(counts) != rownames(pData)")
+}
+
+stopifnot(all.equal(colnames(counts), rownames(pData)))
+
+cat(paste0('\n## Samples Annotation'))
+datatable(pData)
+
+cat(paste0('\n## Summary of Samples Annotation'))
+knitr::kable(summary(pData))
+
+d="log2.data"
+data = get(d)
+if( all.equal( colnames( data ), rownames( pData ))){
+  eset = ExpressionSet( assayData= as.matrix(data), 
+                        phenoData = new("AnnotatedDataFrame", data = pData))
+}
+
+eset$Growth_Pattern = factor( gsub("Invasive/NA", "Invasive", eset$Growth_Pattern), 
+                              levels = c("Circumscribed", "Invasive"))
+
+## ahcorcha
+eset.noMelanoma = eset[,eset$Primary_tumor!="Melanoma"]
+eset.noMelanoma$Primary_tumor = factor(eset.noMelanoma$Primary_tumor)
+
+```
+
+
+
+# Differential gene expression (no melanoma)
+
+## Blocking effects (ref = c("Breast", "Circumscribed"))
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+e = "eset.noMelanoma"
+eseti = get(e)
+
+deg.table = data.frame()
+
+design = model.matrix(~Growth_Pattern + Primary_tumor, eseti)
+colnames(design) = gsub("Primary_tumor", "", colnames(design))
+colnames(design) = gsub("Growth_Pattern", "", colnames(design))
+
+knitr::kable(data.frame(design, 
+                        X =" x ", 
+                        pData(eseti)[, c('Primary_tumor', 'Growth_Pattern')], 
+                        check.names=F))
+
+fit = lmFit(eseti, design)
+fit = eBayes(fit)
+
+deg=topTable(fit, coef="Lung", p.value = 0.05, number = Inf)
+deg = deg %>% 
+  rownames_to_column('Genes') %>% 
+  #arrange(logFC) %>% 
+  filter(P.Value<0.05) %>% 
+  column_to_rownames('Genes') #%>% 
+deg.table = rbind(deg.table, data.frame(Group = "Lung_vs_Breast", deg))
+
+
+deg=topTable(fit, coef="Invasive", p.value = 0.05, number = Inf)
+deg = deg %>% 
+  rownames_to_column('Genes') %>% 
+  #arrange(logFC) %>% 
+  filter(P.Value<0.05) %>% 
+  column_to_rownames('Genes') #%>% 
+deg.table = rbind(deg.table, data.frame(Group = "Invasive_vs_Circumscribed", deg))
+
+rm(design, fit, eseti, deg)
+```
+
+
+## Analyzing as for a Single Factor
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+
+e = "eset.noMelanoma"
+eseti = get(e)
+
+eseti$tumor_growth = factor(paste(eseti$Primary_tumor, eseti$Growth_Pattern, 
+                                  sep = "."))
+
+design = model.matrix(~0+tumor_growth, eseti)
+#colnames(design) = gsub("Primary_tumor", "", colnames(design))
+#colnames(design) = gsub("Growth_Pattern", "", colnames(design))
+colnames(design) = gsub("tumor_growth", "", colnames(design))
+
+knitr::kable(data.frame(design, X ="x", 
+                        pData(eseti)[, c('Primary_tumor', 'Growth_Pattern')], 
+                        check.names=F))
+
+fit = lmFit(eseti, design)
+
+cont.matrix <- makeContrasts( Breast_IvsC = Breast.Invasive - Breast.Circumscribed,
+                              Lung_IvsC = Lung.Invasive - Lung.Circumscribed, 
+                              Circum_BvsL = Breast.Circumscribed - Lung.Circumscribed,
+                              Invasive_BvsL = Breast.Invasive - Lung.Invasive, 
+                              # Diff.tumor = (Breast.Invasive - Breast.Circumscribed) - 
+                              #   (Lung.Invasive - Lung.Circumscribed),
+                              # Diff.growth = (Breast.Invasive - Lung.Invasive) - 
+                              #   (Breast.Circumscribed - Lung.Circumscribed),
+                              levels = design )
+print(cont.matrix)
+
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+results <- decideTests(fit2, p.value = 0.05, lfc = 0.5, adjust.method = "none")
+
+for(i in colnames(cont.matrix)){
+  rm(deg)
+  deg=topTable(fit2, coef=i, p.value = 0.05, number = Inf)
+  if(nrow(deg)>0){
+  deg = deg %>% 
+  rownames_to_column('Genes') %>% 
+  #arrange(logFC) %>% 
+  filter(P.Value<0.05) %>% 
+  column_to_rownames('Genes')
+  deg.table = rbind(deg.table, data.frame(Group = i, deg))}
+}
+
+rm(design, fit, eseti, deg)
+
+
+deg.table$subGroup = factor( ifelse( deg.table$logFC>0, 
+                                     paste0( deg.table$Group,".up" ),
+                                     paste0( deg.table$Group,".down" ) ) )
+
+DEGlist = split(rownames(deg.table),deg.table$subGroup)
+DEGlist2 = split(rownames(deg.table),deg.table$Group)
+```
+
+
+## Heatmaps
+```{r eval=FALSE, fig.height=10, fig.width=12, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+
+print(summary(DEGlist)[,1, drop = F])
+
+colors <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(255)
+
+e = "eset.noMelanoma"
+eseti = base::get(e)
+
+  
+for(i in names(DEGlist2)){
+  
+  i <- names(DEGlist2)[1]
+  
+  cat(paste0("\n\n## ", 'DEG: ', i,'\n\n'))
+
+  rm(yfg, ggdata, hm.data)
+  yfg = DEGlist2[[i]]
+  
+  if( length( yfg > 0 ) ){
+    
+    #heatmap
+    hm.data = data.frame(exprs(eseti))
+    hm.data = hm.data %>% #log2 %>%
+      subset( rownames( hm.data ) %in% yfg )
+    #hm.data = t(scale(t(hm.data), center = T, scale =T))
+    
+    #################################################### LOX_relative_expression
+    # hm.data = reduce( lapply( levels( eseti$LOX_relative_expression ),
+    #                           function(x){ t(scale(t(hm.data)[eseti$LOX_relative_expression==x,]))}),
+    #                   cbind )
+    
+    range <- max(abs(hm.data))
+    annot = pData(eseti)[,c('Primary_tumor', 'Growth_Pattern')]
+
+    print(pheatmap(hm.data, main = paste0("DEGs: ", i), cluster_cols = T,
+                   clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
+                   col = colors,
+                   annotation_col = annot,
+                   show_rownames = F, show_colnames = F,
+                   breaks = c(seq(range.default(hm.data)[1], -0.01, length.out = 255/2),
+                              seq(0.01, range.default(hm.data)[2], length.out = 255/2))
+          ))
+  }
+}
+
+```
+
+
+## Violin plots
+```{r eval=FALSE, fig.height=12, fig.width=12, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+
+eseti = eset.noMelanoma
+
+for(i in names(DEGlist)){
+  
+  rm(ggdata, hm.data)
+  yfg = DEGlist[[i]]
+  if(length(yfg>0)){
+    
+    #data prepapration
+    ggdata = data.frame(exprs(eseti)) %>% 
+      subset(rownames(.) %in% yfg) %>%  
+      t() %>% as.data.frame() %>%
+      rownames_to_column("Sample_ID") %>%
+      add_column(Primary_tumor = pData(eseti)[,"Primary_tumor"], Growth_Pattern = pData(eseti)[,"Growth_Pattern"]) %>%
+      melt()  
+    
+    if(!is.null(ggdata$variable)){
+    print(ggplot(ggdata, aes(x = Primary_tumor, y = value, col = Primary_tumor))+
+            geom_violin()+
+            geom_boxplot(width = 0.2, col="grey")+
+            geom_beeswarm()+
+            scale_color_colorblind()+
+            #facet_grid(variable ~ Growth_Pattern, scales = "free_y")+
+            facet_wrap(~variable, ncol = 3)+
+            stat_compare_means(na.rm=T, label = "p.format",
+                               label.x.npc="center",
+                               label.y.npc = 0.9,
+                               method="kruskal.test")+
+            labs(title = paste0("DEGs: ", i))+
+            geom_text_repel(data=ggdata,
+                            aes(label=Sample_ID),
+                            size = 4,
+                            box.padding = unit(0.35, "lines"),
+                            point.padding = unit(0.3, "lines"))+
+            theme_few())
+      
+    
+    print(ggplot(ggdata, aes(x = Growth_Pattern, y = value, col = Growth_Pattern))+
+            geom_violin()+
+            geom_boxplot(width = 0.2, col="grey")+
+            geom_beeswarm()+
+            scale_color_colorblind()+
+            facet_wrap(~variable, ncol = 3)+
+            stat_compare_means(na.rm=T, label = "p.format",
+                               label.x.npc="center",
+                               label.y.npc = 0.9,
+                               method="kruskal.test")+
+            labs(title = paste0("DEGs: ", i))+
+            geom_text_repel(data=ggdata,
+                            aes(label=Sample_ID),
+                            size = 4,
+                            box.padding = unit(0.35, "lines"),
+                            point.padding = unit(0.3, "lines"))+
+            theme_few())
+     }
+  }
+}
+
+```
+
+
+## Enrichment analysis
+```{r eval=FALSE, fig.height=10, fig.width=12, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+
+# HALLMARK_genesets = read.table("HALLMARK_genesets.txt", sep = "\t", header = T, row.names = 1)
+
+HALLMARK_genesets <- msigdbr(species = "Homo sapiens") %>%
+    dplyr::filter(gs_cat %in% c("H")) %>% 
+    dplyr::select(gs_name, gene_symbol)
+
+
+# Original name: GeoMx_Cancer Transcriptome Atlas_annotations.txt
+# https://nanostring.com/support-documents/geomx-hs-cta-v1-0/
+# CTA_genesets = read.table("GeoMx_Cancer Transcriptome Atlas_annotations.txt", row.names=1, header =T)
+
+CTA_genesets = read.csv( "./ref/GeoMx_Hs_CTA_v1.0.tab", header =T, sep = "\t" )
+
+
+CTA_genesets = lapply(CTA_genesets, function(x) rownames(CTA_genesets)[x!=0])
+
+
+CTA_genesets = reshape2::melt(CTA_genesets)[,c(2,1)]%>%
+  magrittr::set_colnames(c('gs_name', 'gene_symbol')) #%>%
+  #dplyr::mutate(entrez_gene = mapIds(org.Hs.eg.db, as.character(gene_symbol),"ENTREZID", "SYMBOL")) %>% 
+  #dplyr::select(gs_name, entrez_gene)
+CTA_genesets$gs_name=gsub("0", "-", CTA_genesets$gs_name)
+
+colors <- colorRampPalette(rev(brewer.pal(9, "Reds")))(100)
+
+#DEGlist=lapply(DEGlist, function(x) {
+  #require(org.Hs.eg.db); unname(mapIds(org.Hs.eg.db, x,"ENTREZID", "SYMBOL"))}
+  #)
+#names(DEGlist)= gsub('deg.', '', names(DEGlist))
+
+for(g in c('HALLMARK_genesets', 'CTA_genesets')){
+  ck = compareCluster(geneCluster = DEGlist, fun = "enricher", TERM2GENE=get(g),
+                          #organism     = 'hsa',
+                          pAdjustMethod = "BH",
+                          universe = rownames(data),
+                          qvalueCutoff = 0.05
+                         )
+  print(dotplot(ck, showCategory = NULL)+
+    labs(title=paste0(g, ': DEG sets'))+
+      scale_color_continuous(low = colors[1], high = colors[75],
+                               name = "p.adjust", guide=guide_colorbar(reverse=T)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  }
+  
+```
+
+
+
+
+
+# GSEA-based results
+## logFC of GSEA top genes
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+gsea.top = read.table('GSEA_top.genes.txt', sep = '\t', header = T)
+gsea.top$log2FC = NA
+
+for(gs in unique(gsea.top$Group)){
+  if(gs == 'Breast_IvsC'){
+    eseti = eset.noMelanoma[, eset.noMelanoma$Primary_tumor=='Breast']
+    data = exprs(eseti)
+    log2FC = rowMeans(data[,eseti$Growth_Pattern=="Invasive"]) - data[,eseti$Growth_Pattern=="Circumscribed"]
+    } else if(gs == 'Lung_IvsC'){
+      eseti = eset.noMelanoma[, eset.noMelanoma$Primary_tumor=='Lung']
+      data = exprs(eseti)
+      log2FC = rowMeans(data[,eseti$Growth_Pattern=="Invasive"]) - rowMeans(data[,eseti$Growth_Pattern=="Circumscribed"])
+    }else if(gs == 'Combined_IvsC'){
+      eseti = eset.noMelanoma
+      data = exprs(eseti)
+      log2FC = rowMeans(data[,eseti$Growth_Pattern=="Invasive"]) - rowMeans(data[,eseti$Growth_Pattern=="Circumscribed"])
+    }
+  for(gene in rownames(eset.noMelanoma)){
+  gsea.top$log2FC[gsea.top$Group == gs & gsea.top$Gene == gene] <- log2FC[gene]}
+}
+
+write.table(gsea.top, 'gsea.top.txt', sep = "\t", col.names = NA)
+
+ggplot(melt(gsea.top), aes(variable, value))+
+  geom_violin()+
+  geom_boxplot(width = 0.1, fill = 'grey')+
+  facet_wrap(~Subgroup)+
+  geom_hline(yintercept = 0, col = 'grey', linetype = 2)+
+  theme_few()
+```
+
+
+## leading edge genes
+```{r eval=FALSE, fig.height=10, fig.width=12, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+
+colors <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(255)
+
+lea.genes = read.table('leadingEdge_All.Invasive.vs.Circumscribed_permute.geneset_HALLMARK_FDR(0.25).txt',
+                                sep='\t', header = T, row.names = 1)
+lea.genes = rownames(lea.genes)[lea.genes$Sum>=2]
+
+
+#whole data set
+print(pheatmap(eset[lea.genes,], scale = "row",
+         annotation_col = pData(eset)[, c("Primary_tumor", "Growth_Pattern")],
+           clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
+           col = colors, main = 'All samples, euclidean',
+           show_rownames = T, show_colnames = F))
+
+#whole data set, ordered
+library(Pigengene)
+hm.order = pheatmap.type(t(exprs(eset[lea.genes,])), pData(eset)[,c('Primary_tumor', 'Growth_Pattern')], 
+              type = 'Primary_tumor', doTranspose=T, conditions="Auto",
+              clustering_distance_rows = "manhattan")$ordering
+
+eseti = eset[lea.genes,hm.order]; eseti = eseti[,c(1:8, 16:19, 9:15, 20, 22,23, 21)]
+
+hm.data = purrr::reduce(lapply(levels(eseti$Primary_tumor), 
+                               function(x) t(scale(t(exprs(eseti)[,eseti$Primary_tumor==x])))), cbind)
+
+print(pheatmap(hm.data, 
+               annotation_col = pData(eseti)[, c("Primary_tumor", "Growth_Pattern")],
+               clustering_distance_rows = "manhattan",
+               #clustering_distance_cols = "manhattan",
+               cluster_cols = F, cluster_rows = T,
+               col = colors, main = 'All samples, clustered by Tumor, scaled by Tumor',
+               show_rownames = T, show_colnames = T))
+
+##subset by Primary Tumor
+lapply(levels(eset$Primary_tumor), function(x)
+print(pheatmap(eset[lea.genes,eset$Primary_tumor==x], scale = "row",
+         annotation_col = pData(eset)[, c("Primary_tumor", "Growth_Pattern")],
+           clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
+           col = colors, main = x,
+           show_rownames = T, show_colnames = F))
+)
+
+#subset by Growth Pattern
+lapply(levels(eset$Growth_Pattern), function(x)
+print(pheatmap(eset[lea.genes,eset$Growth_Pattern==x], scale = "row",
+         annotation_col = pData(eset)[, c("Primary_tumor", "Growth_Pattern")],
+           clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
+           col = colors, main = x,
+           show_rownames = T, show_colnames = F))
+)
+
+
+
+
+
+
+
+
+```
+
+
+## #Single sample gene set enrichment
+```{r eval=FALSE, fig.height=6, fig.width=12, message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+
+rm(gs)
+colors <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(255)
+
+gs.list = split(HALLMARK_genesets$gene_symbol,HALLMARK_genesets$gs_name)
+
+gsva_es = gsva(eset, gs.list, min.sz=10, max.sz=500, verbose=TRUE, mx.dif = F)
+design = model.matrix(~Growth_Pattern + Primary_tumor, gsva_es)
+colnames(design) = gsub("Primary_tumor", "", colnames(design))
+colnames(design) = gsub("Growth_Pattern", "", colnames(design))
+fit = lmFit(gsva_es, design)
+fit = eBayes(fit)
+
+dep = topTable(fit, coef="Invasive", number=10) %>% filter(P.Value<0.05)
+
+pheatmap(gsva_es[rownames(dep),], scale = "none",
+         annotation_col = pData(gsva_es)[, c("Primary_tumor", "Growth_Pattern")],
+           clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
+           col = colors, 
+           show_rownames = T, show_colnames = F)
+
+
+```
+
+
+
+# GSEA-based analysis (Lung)
+## GSEA score and FC
+```{r fig.height=6, fig.width=12, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+gsea.scores = read.table("GSEA_Ranked.gene.list_Lung_Invasive.vs.Circumscribed.txt",
+                         header = T, sep = "\t") %>%
+  filter(X!='null') %>%
+  column_to_rownames('X')
+
+#include = intersect(rownames(eset), rownames(gsea.scores))
+#eseti = eset[rownames(eset) %in% include, ]
+#gsea.scores = gsea.scores[rownames(gsea.scores) %in% include, , drop = F]
+
+eseti = eset
+
+#FC by limma
+df.matrix = data.frame(matrix(NA, nrow(eseti), nlevels(eseti$Primary_tumor),
+                       dimnames = list(rownames(eseti), paste0("logFC_",c("Lung", "Breast", "Melanoma")))))
+
+fc.table = df.matrix; p.table = df.matrix; rm(df.matrix)
+
+for(i in levels(eseti$Primary_tumor)){
+  
+  e = eseti[ ,eseti$Primary_tumor==i] 
+  design = model.matrix(~Growth_Pattern, e)
+  colnames(design) = gsub("Growth_Pattern", "", colnames(design))
+  fit = lmFit(e, design)
+  fit = eBayes(fit)
+  df = topTable(fit, coef="Invasive", number = Inf, sort.by = "none")
+  fc.table[, paste0("logFC_",i)] = df$logFC
+  p.table[, paste0("logFC_",i)] = df$P.Value
+  
+  rm(e, design, fit, df)
+}
+gsea.scores = merge(gsea.scores, fc.table, by = 0) %>% column_to_rownames("Row.names")
+
+#FC manually
+#df = data.frame(matrix(NA, nrow(eseti), nlevels(eseti$Primary_tumor),
+                      # dimnames = list(rownames(eseti), paste0("manualFC_",levels(eseti$Primary_tumor)))))
+#for(i in levels(eseti$Primary_tumor)){
+  #e = eseti[,eseti$Primary_tumor==i] 
+  #df[, paste0("manualFC_",i)] = rowMeans(exprs(e)[, e$Growth_Pattern=="Invasive", drop = F]) - rowMeans(exprs(e)[, e$Growth_Pattern=="Circumscribed", drop = F])
+#}
+#gsea.scores = merge(gsea.scores, df, by = 0)%>%column_to_rownames("Row.names")
+
+
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+library(psych)
+pairs.panels(gsea.scores, 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE, # show correlation ellipses
+             main = "All genes"
+             )
+
+top.genes = rownames(top_n(gsea.scores, 100, gsea.scores$SCORE))
+bottom.genes = rownames(top_n(gsea.scores, -100, gsea.scores$SCORE))
+top.bottom.genes = c(top.genes, bottom.genes)
+
+
+for(i in c('top.bottom.genes', 'top.genes', 'bottom.genes')){
+psych::pairs.panels(subset(gsea.scores, rownames(gsea.scores)%in%get(i)), 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             main = i
+             )
+}
+
+```
+
+## Conistent genes among tumors
+```{r fig.height=6, fig.width=12, message=FALSE, warning=FALSE, paged.print=FALSE}
+decide.matrix = data.frame(decideTests(as.matrix(p.table), method = "separate",
+                            adjust.method = "none",
+                            p.value = 1, coefficients = as.matrix(fc.table)),
+                           check.names = F)
+decide.matrix$sum = rowSums(decide.matrix)
+
+cat("Summary of decide.matrix")
+table(decide.matrix$sum)
+consistent.genes = rownames(decide.matrix)[which(abs(decide.matrix$sum)==3)]
+
+top.decide.matrix = subset(decide.matrix, rownames(decide.matrix) %in% top.bottom.genes)
+cat("summary of top.decide.matrix")
+table(top.decide.matrix$sum)
+
+consistent.top.bottom.genes = consistent.genes[consistent.genes %in% top.bottom.genes]
+consistent.top.genes = consistent.genes[consistent.genes %in% top.genes]
+consistent.bottom.genes = consistent.genes[consistent.genes %in% bottom.genes]
+
+for(i in c('consistent.genes', 'consistent.top.bottom.genes',
+           'consistent.top.genes', 'consistent.bottom.genes')){
+psych::pairs.panels(subset(fc.table, rownames(fc.table)%in%get(i)), 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             main = i
+             )
+}
+```
+
+## LEA and FC
+```{r fig.height=6, fig.width=12, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+lea.genes = read.table("LEA.matrix_Lung_InvasiveVSCircumscribed.txt", header = T, sep = "\t", row.names = 1) %>%
+  dplyr::select(Sum) %>% filter(Sum>=2)
+lea.genes = rownames(lea.genes)
+
+count(lea.genes)
+
+#FC by limma
+eseti = eset
+df.matrix = data.frame(matrix(NA, nrow(eseti), nlevels(eseti$Primary_tumor),
+                       dimnames = list(rownames(eseti), paste0("logFC_",c("Lung", "Breast", "Melanoma")))))
+
+fc.table = df.matrix; p.table = df.matrix; rm(df.matrix)
+
+for(i in levels(eseti$Primary_tumor)){
+  
+  e = eseti[ ,eseti$Primary_tumor==i] 
+  design = model.matrix(~Growth_Pattern, e)
+  colnames(design) = gsub("Growth_Pattern", "", colnames(design))
+  fit = lmFit(e, design)
+  fit = eBayes(fit)
+  df = topTable(fit, coef="Invasive", number = Inf, sort.by = "none")
+  fc.table[, paste0("logFC_",i)] = df$logFC
+  p.table[, paste0("logFC_",i)] = df$P.Value
+  
+  rm(e, design, fit, df)
+}
+
+lea.df = subset(fc.table, rownames(fc.table)%in%lea.genes)
+
+
+pairs.panels(lea.df, 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE, # show correlation ellipses
+             main = "All genes"
+             )
+
+
+```
