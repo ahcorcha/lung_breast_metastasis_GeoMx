@@ -14,7 +14,6 @@ library(ggrepel)
 library(ade4)
 library(factoextra)
 library(UpSetR)
-library(tidyverse)
 library(enrichR)
 library(DT)
 library(tidyr)
@@ -28,21 +27,59 @@ library(msigdbr)
 library(ggplot2)
 library(RColorBrewer)
 library(enrichplot)
-library(reshape2)
-library(ggpubr)
 library(pheatmap)
 library(ggbeeswarm)
 library(GSVA)
 library(psych)
 library(Biobase)
 #library(GSEABase)
-suppressMessages(library("fgsea"))
+library(fgsea)
 library(ComplexHeatmap)
-library("circlize")
-library("GSA")
-
+library(circlize)
+library(GSA)
 library(dplyr)
+
+library(ggpubr)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(RColorBrewer)
+library(RUVSeq)
 library(reshape2)
+library(outliers)
+library(preprocessCore)
+library(fitdistrplus)
+library(data.table)
+
+###########################################Functions##############################
+filters <- function(x){ length(x[x>5])>=2 }
+
+gm_mean = function(x, na.rm=TRUE){ exp(sum(log(x[x>0]), na.rm=na.rm)/length(x)) }
+
+scaledata <- function(x){ return((x-min(x))/(max(x)-min(x))) }
+
+RowVar <- function(x, ...) { rowSums((x - rowMeans(x, ...))^2, ...)/(dim(x)[2] - 1) }
+
+RLE <- function(counts = counts){
+  # counts <- q3_counts
+  this.RLE <- as.matrix( log2( counts + 1 ) )
+  gene_medians <- rowMedians( this.RLE, useNames = FALSE )
+  return( this.RLE - gene_medians )
+}
+
+get_boxplot_stats <- function(vect){
+  return( boxplot.stats( vect, 
+                         coef = 1.5, do.conf = TRUE, do.out = TRUE)$stats )
+}
+
+get_boxplot_df <- function(mat){
+  
+  mat_boxplot <- as.data.frame(t( apply(X = mat, MARGIN = 2, FUN = get_boxplot_stats)))
+  colnames(mat_boxplot) <- c("q0", "q25", "q50", "q75", "q100")
+  mat_boxplot$sample <- rownames(mat_boxplot)
+  return(mat_boxplot)
+}
+
 
 HALLMARK_GMT <- GSA.read.gmt("./ref/h.all.v7.5.1.symbols.gmt")
 
@@ -52,20 +89,411 @@ Sys.setenv( OUTDIR = outdir )
 ```
 
 
+
+```{r}
+out_dir <- "./data/"
+pData <- read.table("./data/IN/samples_description.txt", row.names=1, header =T)
+pData$ROI <- factor(pData$ROI)
+pData$sample <- rownames(pData)
+pData$type <- paste0( pData$Primary_tumor, "_", pData$Growth_Pattern )
+
+pData$type <- as.factor(pData$type)
+pData$Primary_tumor <- as.factor(pData$Primary_tumor)
+pData$Growth_Pattern <- as.factor(pData$Growth_Pattern)
+
+```
+
+
+
+## Load counts
+```{r}
+# https://zenodo.org/records/7348326
+# Alternative normalization and analysis pipeline to address systematic bias in NanoString GeoMx Digital Spatial Profiling data
+
+q3_counts <- as.data.frame( read.table('./data/IN/Normalized_CountMatrix_Q3.Norm.txt', 
+                                       header = T, sep = '\t',row.names = 1 ) )
+
+raw_counts <- as.data.frame( read.table('./data/IN/Step1_CTA_Initial_Dataset_Raw_counts_all.csv', 
+                                       header = T, sep = ',' ) )
+
+del_cols <- c("ProbeName", "TargetName", "HUGOSymbol", "Accessions", "GenomicPosition", 
+              "AnalyteType", "CodeClass", "ProbePool", "TargetGroup")
+
+raw_counts_mat <- raw_counts[ , -which(names(raw_counts) %in% del_cols) ]
+rownames(raw_counts_mat) <- raw_counts_mat$ProbeDisplayName
+raw_counts_mat <- raw_counts_mat[,-1]
+
+# ./data/IN/Step2_CTA_Probe_QC.csv
+# ./data/IN/Step3_CTA_Q3_Normalized.csv
+# ./data/IN/Step3_CTA_SNR.csv
+
+```
+
+
+
+## Quantile normalization
+```{r}
+# raw_counts <- read.csv( "./data/IN/Step1_CTA_Initial_Dataset_Raw_counts_all.csv" )
+raw_counts_filtered <- raw_counts[ , colnames(raw_counts) != "TMA1_011" ]
+
+######################### Convert wide to long format matrix ###################
+
+raw_counts_long <- melt( data = setDT( raw_counts_filtered ), 
+                         id.vars = c( "ProbeName", "ProbeDisplayName", "TargetName", 
+                                      "HUGOSymbol", "Accessions", "GenomicPosition", 
+                                      "AnalyteType", "CodeClass", "ProbePool", "TargetGroup" ), 
+              variable.name = "ROI" )
+
+colnames( raw_counts_long ) <- gsub( "^value$", "Count", colnames( raw_counts_long ) )
+
+
+############################# Taking gm_mean data ##############################
+data.orig.gm <- raw_counts_long %>% 
+               group_by(ROI, TargetName) %>% 
+               summarize(Count = gm_mean(Count))
+
+LOQ_value <- 2  #For CTA we recommend 2.5 as a stringent threshold and 2.0 for a slightly permissive threshold.
+
+#calculate LOQ 
+LOQ.test.orig = raw_counts_long %>% 
+                filter(CodeClass == "Negative") %>% 
+                group_by(ROI) %>% 
+                summarize(gm_mean = gm_mean(Count), 
+                          sd      = sd(Count)) %>% 
+                mutate(LOQ = gm_mean+sd*LOQ_value)
+
+#calculate signal/noise ratio
+LOQ.vis.orig = data.orig.gm %>% 
+               left_join(LOQ.test.orig %>% dplyr::select(ROI, LOQ), by = "ROI") %>% 
+               mutate(ston = Count/LOQ)
+
+#names of probes that are below LOQ
+low.targets.orig = LOQ.vis.orig %>% 
+                   group_by(TargetName) %>% 
+                   summarize(test = any(ston>1)) %>% 
+                   filter(test == F) %>% 
+                   pull(TargetName)
+
+#filter results that are 100% below LOQ
+LOQ.res.orig = data.orig.gm %>% 
+               filter(!TargetName %in% low.targets.orig) %>% 
+               pivot_wider(values_from = Count, names_from = ROI) %>% 
+               column_to_rownames("TargetName") 
+
+
+################################## Quantile normalization ######################
+norm_quantile <- normalize.quantiles(as.matrix(LOQ.res.orig))
+dimnames(norm_quantile) <- dimnames(LOQ.res.orig)
+
+```
+
+
+## Sequencing QC
+## Sum of counts
+Sequencing QC - Counts from each AOI are analyzed and under-sequenced samples are dropped from downstream QC.
+Drop sample #11
+```{r}
+
+total_counts <- as.data.frame(colSums(raw_counts_mat, na.rm = TRUE))
+colnames(total_counts) <- "sum_norm_counts"
+total_counts$name <- rownames(total_counts)
+
+
+total_counts <- merge( x = total_counts, y = pData,
+                       by.x = "name", by.y = "sample", all.x = TRUE )
+
+
+dotplot <- ggplot( total_counts, aes( y = name, x = sum_norm_counts, 
+                                      color = Primary_tumor, shape = Growth_Pattern ) ) +
+   geom_point() +
+   theme_light() + ggtitle("Sum of raw counts") +
+   # theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+   NULL
+
+ggsave( filename = paste0(outdir, "/total_raw_counts.pdf"), 
+        plot = dotplot, height = 5, width = 6 )
+
+
+############################################################################# ##
+############################################################################# ##
+
+
+total_counts <- as.data.frame(colSums(q3_counts, na.rm = TRUE))
+colnames(total_counts) <- "sum_norm_counts"
+total_counts$name <- rownames(total_counts)
+
+
+total_counts <- merge( x = total_counts, y = pData,
+                       by.x = "name", by.y = "sample", all.x = TRUE )
+
+
+dotplot <- ggplot( total_counts, aes( y = name, x = sum_norm_counts, 
+                                      color = Primary_tumor, shape = Growth_Pattern ) ) +
+   geom_point() +
+   theme_light() + ggtitle("Sum of Q3 normalized counts") +
+   # theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+   NULL
+
+ggsave( filename = paste0(outdir, "/total_Q3_normalized_counts.pdf"), 
+        plot = dotplot, height = 5, width = 6 )
+
+
+
+############################################################################# ##
+pData <- pData[ pData$sample != "TMA1_011", ]
+############################################################################# ##
+
+```
+
+
+
+
+## RLE boxplots
+1.Gandolfo, L. C. & Speed, T. P. 
+RLE plots: Visualizing unwanted variation in high dimensional data. 
+PLOS ONE 13, e0191629 (2018).
+```{r RLE}
+
+RLE_raw_counts <- RLE( raw_counts_mat )
+RLE_q3_counts <- RLE( q3_counts )
+RLE_norm_quantile <- RLE( norm_quantile )
+
+
+raw_RLE_boxplot <- get_boxplot_df(RLE_raw_counts)
+Q3_norm_RLE_boxplot <- get_boxplot_df(RLE_q3_counts)
+norm_quantile_RLE_boxplot <- get_boxplot_df(RLE_norm_quantile)
+
+
+raw_RLE_boxplot <- merge( x = raw_RLE_boxplot, y = pData, by = "sample" )
+
+Q3_norm_RLE_boxplot <- merge( x = Q3_norm_RLE_boxplot, y = pData,by = "sample" )
+
+norm_quantile_RLE_boxplot <- merge( x = norm_quantile_RLE_boxplot, y = pData,by = "sample" )
+
+
+
+
+p_raw_RLE_boxplot <- ggplot(raw_RLE_boxplot, aes(x=sample, fill=type)) +
+                            geom_boxplot( aes(ymin = q0, lower = q25, 
+                                              middle = q50, upper = q75, 
+                                              ymax = q100),
+                                          stat = "identity") + 
+                            theme_light() + 
+                            theme(axis.text.x = element_text(angle = 90)) + 
+                            ggtitle("Raw RLE") + ylim(-3,3)
+
+p_Q3_norm_RLE_boxplot <- ggplot(Q3_norm_RLE_boxplot, aes(x=sample, fill=type)) +
+                                geom_boxplot( aes(ymin = q0, lower = q25, 
+                                                  middle = q50, upper = q75, 
+                                                  ymax = q100),
+                                              stat = "identity") + 
+                                theme_light() + 
+                                theme(axis.text.x = element_text(angle = 90)) + 
+                                ggtitle("Q3 normalization RLE") + ylim(-3,3)
+
+
+p_norm_quantile_RLE_boxplot <- ggplot(norm_quantile_RLE_boxplot, aes(x=sample, fill=type)) +
+                                geom_boxplot( aes(ymin = q0, lower = q25, 
+                                                  middle = q50, upper = q75, 
+                                                  ymax = q100),
+                                              stat = "identity") + 
+                                theme_light() + 
+                                theme(axis.text.x = element_text(angle = 90)) + 
+                                ggtitle("Quantile normalization RLE") + ylim(-3,3)
+
+
+p_box <- p_raw_RLE_boxplot / p_Q3_norm_RLE_boxplot / p_norm_quantile_RLE_boxplot
+
+# p_box
+ggsave( filename = paste0(outdir, "/01_RLE_boxplot_group_by_tissue_type.pdf"), 
+        plot = p_box, width = 12, height = 15)
+
+# rm(p_box, p_raw_RLE_boxplot, p_Q3_norm_RLE_boxplot,
+#    Q3_norm_RLE_boxplot, raw_RLE_boxplot, 
+#    RLE_raw_counts, RLE_Q3_norm)
+
+```
+
+
+
+
+
+#### PCA
+```{r}
+########################################### 1. All samples, all conditions #####
+
+
+tmp_counts <- norm_quantile[, pData[ pData$Primary_tumor %in% c("Breast", "Lung"), "sample"] ]
+
+norm_counts_dt <- t( tmp_counts )
+
+norm_counts.pca <- prcomp( norm_counts_dt, scale = TRUE )
+
+#reverse the signs
+norm_counts.pca$rotation <- -1*norm_counts.pca$rotation
+
+#reverse the signs of the scores
+norm_counts.pca$x <- -1*norm_counts.pca$x
+
+#calculate total variance explained by each principal component
+vars <- norm_counts.pca$sdev^2 / sum(norm_counts.pca$sdev^2)
+
+pcs <- as.data.frame( norm_counts.pca$x )
+pcs$sample <- rownames( pcs )
+
+
+pcs <- merge( x = pData, y = pcs,
+              by = "sample", all.y = TRUE )
+
+PCA <- ggplot( pcs, aes(PC1, PC2, label = sample, color = Primary_tumor, shape = Growth_Pattern )) +
+               geom_point(size=2) +
+               xlab(paste0("PC1 (", round( 100*vars[1], 2 ), "%)" )) +
+               ylab(paste0("PC2 (", round( 100*vars[2], 2 ), "%)"  )) +
+               ggtitle( paste0( "PCA - all samples " ) ) +
+               theme_light() +
+               geom_label_repel()
+
+ggsave( paste0( outdir, "/PCA_all_samples_norm_quantiles.pdf"), plot = PCA,
+        width = 9, height = 9 )
+
+
+
+########################################### 1. All samples, all conditions #####
+
+tmp_counts <- norm_quantile[, pData[ pData$Primary_tumor %in% c("Lung"), "sample"] ]
+norm_counts_dt <- t( tmp_counts )
+
+norm_counts.pca <- prcomp( norm_counts_dt, scale = TRUE )
+
+#reverse the signs
+norm_counts.pca$rotation <- -1*norm_counts.pca$rotation
+
+#reverse the signs of the scores
+norm_counts.pca$x <- -1*norm_counts.pca$x
+
+#calculate total variance explained by each principal component
+vars <- norm_counts.pca$sdev^2 / sum(norm_counts.pca$sdev^2)
+
+pcs <- as.data.frame( norm_counts.pca$x )
+pcs$sample <- rownames( pcs )
+
+
+pcs <- merge( x = pData, y = pcs,
+              by = "sample", all.y = TRUE )
+
+PCA <- ggplot( pcs, aes(PC1, PC2, label = sample, color = Growth_Pattern )) +
+               geom_point(size=2) +
+               xlab(paste0("PC1 (", round( 100*vars[1], 2 ), "%)" )) +
+               ylab(paste0("PC2 (", round( 100*vars[2], 2 ), "%)"  )) +
+               ggtitle( paste0( "PCA - Lung " ) ) +
+               theme_light() +
+               geom_label_repel()
+
+ggsave( paste0( outdir, "/PCA_Lung_norm_quantiles.pdf"), plot = PCA,
+        width = 9, height = 9 )
+
+
+
+
+##################################################################################### ##
+##################################################################################### ##
+##################################################################################### ##
+
+########################################### 1. All samples, all conditions #####
+
+tmp_counts <- q3_counts[, pData[ pData$Primary_tumor %in% c("Breast", "Lung"), "sample"] ]
+
+norm_counts_dt <- t( tmp_counts )
+
+norm_counts.pca <- prcomp( norm_counts_dt, scale = TRUE )
+
+#reverse the signs
+norm_counts.pca$rotation <- -1*norm_counts.pca$rotation
+
+#reverse the signs of the scores
+norm_counts.pca$x <- -1*norm_counts.pca$x
+
+#calculate total variance explained by each principal component
+vars <- norm_counts.pca$sdev^2 / sum(norm_counts.pca$sdev^2)
+
+pcs <- as.data.frame( norm_counts.pca$x )
+pcs$sample <- rownames( pcs )
+
+
+pcs <- merge( x = pData, y = pcs,
+              by = "sample", all.y = TRUE )
+
+PCA <- ggplot( pcs, aes(PC1, PC2, label = sample, color = Primary_tumor, shape = Growth_Pattern )) +
+               geom_point(size=2) +
+               xlab(paste0("PC1 (", round( 100*vars[1], 2 ), "%)" )) +
+               ylab(paste0("PC2 (", round( 100*vars[2], 2 ), "%)"  )) +
+               ggtitle( paste0( "PCA - all samples " ) ) +
+               theme_light() +
+               geom_label_repel()
+
+ggsave( paste0( outdir, "/PCA_all_samples_q3_norm.pdf"), plot = PCA,
+        width = 9, height = 9 )
+
+
+
+########################################### 1. All samples, all conditions #####
+
+tmp_counts <- q3_counts[, pData[ pData$Primary_tumor %in% c("Lung"), "sample"] ]
+norm_counts_dt <- t( tmp_counts )
+
+norm_counts.pca <- prcomp( norm_counts_dt, scale = TRUE )
+
+#reverse the signs
+norm_counts.pca$rotation <- -1*norm_counts.pca$rotation
+
+#reverse the signs of the scores
+norm_counts.pca$x <- -1*norm_counts.pca$x
+
+#calculate total variance explained by each principal component
+vars <- norm_counts.pca$sdev^2 / sum(norm_counts.pca$sdev^2)
+
+pcs <- as.data.frame( norm_counts.pca$x )
+pcs$sample <- rownames( pcs )
+
+
+pcs <- merge( x = pData, y = pcs,
+              by = "sample", all.y = TRUE )
+
+PCA <- ggplot( pcs, aes(PC1, PC2, label = sample, color = Growth_Pattern  )) +
+               geom_point(size=2) +
+               xlab(paste0("PC1 (", round( 100*vars[1], 2 ), "%)" )) +
+               ylab(paste0("PC2 (", round( 100*vars[2], 2 ), "%)"  )) +
+               ggtitle( paste0( "PCA - Lung " ) ) +
+               theme_light() +
+               geom_label_repel()
+
+ggsave( paste0( outdir, "/PCA_Lung_q3_norm.pdf"), plot = PCA,
+        width = 9, height = 9 )
+
+
+
+
+```
+
+
+
 # 1 Data preparation
 ```{r}
-counts = read.table('./data/IN/Normalized_CountMatrix_Q3.Norm.txt', header=T, sep='\t',row.names=1)
-data.scale=scale(log2(counts))
-log2.data=log2(counts)
-
-pData = read.table("./data/IN/samples_description.txt", row.names=1, header =T)
-pData$ROI = factor(pData$ROI)
-pData= subset(pData, rownames(pData)%in%colnames(counts))
-
-if(!all.equal(colnames(counts), rownames(pData))){print("Error: colnames(counts) != rownames(pData)")}
-stopifnot(all.equal(colnames(counts), rownames(pData)))
-
-cat(paste0('\n## Samples Annotation'))
+# counts = read.table('./data/IN/Normalized_CountMatrix_Q3.Norm.txt', header=T, sep='\t',row.names=1)
+# data.scale=scale(log2(counts))
+# log2.data=log2(counts)
+# 
+# pData = read.table("./data/IN/samples_description.txt", row.names=1, header =T)
+# pData$ROI = factor(pData$ROI)
+# pData= subset(pData, rownames(pData)%in%colnames(counts))
+# 
+# pData$sample_name <- rownames(samples)
+# 
+# 
+# if(!all.equal(colnames(counts), rownames(pData))){print("Error: colnames(counts) != rownames(pData)")}
+# stopifnot(all.equal(colnames(counts), rownames(pData)))
+# 
+# cat(paste0('\n## Samples Annotation'))
 ```
 
 
@@ -73,6 +501,8 @@ cat(paste0('\n## Samples Annotation'))
 ```{r}
 datatable(pData)
 ```
+
+
 
 ```{r}
 cat(paste0('\n## Summary of Samples Annotation'))
@@ -82,22 +512,22 @@ cat(paste0('\n## Summary of Samples Annotation'))
 
 ```{r}
 knitr::kable(summary(pData))
-
 ```
 
 
 
 ```{r}
-d="log2.data"
-data = get(d)
+data <- log2( norm_quantile )
 if(all.equal(colnames(data), rownames(pData))){
   eset = ExpressionSet(assayData= as.matrix(data),phenoData=new("AnnotatedDataFrame",data=pData))
 }
 
-eset$Growth_Pattern = factor(gsub("Invasive/NA", "Invasive", eset$Growth_Pattern), levels = c("Circumscribed", "Invasive"))
+eset$Growth_Pattern = factor( gsub("Invasive/NA", "Invasive", eset$Growth_Pattern), 
+                              levels = c("Circumscribed", "Invasive"))
 
-eset.noMelanoma = eset[,eset$Primary_tumor!="Melanoma"]
-eset.noMelanoma$Primary_tumor = factor(eset.noMelanoma$Primary_tumor)
+eset.noMelanoma = eset[ , eset$Primary_tumor!="Melanoma" ]
+eset.noMelanoma$Primary_tumor = factor( eset.noMelanoma$Primary_tumor )
+
 ```
 
 
@@ -120,29 +550,41 @@ knitr::kable(data.frame(design, X =" x ",pData(eseti)[, c('Primary_tumor', 'Grow
 
 
 ```{r}
+pval_th <- 0.05
+adj_pval_th <- 0.1
+pval_ad_method <- "BH"
+
+
+
 fit = lmFit(eseti, design)
 fit = eBayes(fit)
 
-deg=topTable(fit, coef="Lung", number=100, sort.by = "P", resort.by = "logFC")
-deg = deg %>% 
-  rownames_to_column('Genes') %>% 
-  #arrange(logFC) %>% 
-  # filter(P.Value<0.05) %>%
-  filter(adj.P.Val<0.1) %>% 
-  column_to_rownames('Genes') #%>% 
-deg.table = rbind(deg.table, data.frame(Group = "Lung_vs_Breast", deg))
+deg=topTable(fit, coef="Lung", number=Inf, sort.by = "P", resort.by = "logFC", adjust.method = pval_ad_method)
+
+deg$Genes <- rownames(deg)
+deg$Group <- "Lung_vs_Breast"
+rownames(deg) <- NULL
+  
+# deg <- deg[ deg$P.Value < pval_th, ]
+deg <- deg[ deg$adj.P.Val < adj_pval_th, ]
+
+deg.table = rbind(deg.table, data.frame( deg))
 
 
-deg=topTable(fit, coef="Invasive", number=100, sort.by = "P", resort.by = "logFC")
-deg = deg %>% 
-  rownames_to_column('Genes') %>% 
-  #arrange(logFC) %>% 
-  # filter(P.Value<0.05) %>%
-  filter(adj.P.Val<0.1) %>%
-  column_to_rownames('Genes') #%>% 
-deg.table = rbind(deg.table, data.frame(Group = "Invasive_vs_Circumscribed", deg))
 
-# rm(design, fit, eseti, deg)
+
+deg=topTable(fit, coef="Invasive", number=Inf, sort.by = "P", resort.by = "logFC", adjust.method = pval_ad_method)
+
+deg$Genes <- rownames(deg)
+deg$Group <- "Invasive_vs_Circumscribed"
+rownames(deg) <- NULL
+  
+# deg <- deg[ deg$P.Value < pval_th, ]
+deg <- deg[ deg$adj.P.Val < adj_pval_th, ]
+
+deg.table = rbind(deg.table, data.frame(deg))
+
+rm(design, fit, eseti, deg)
 ```
 
 
@@ -171,6 +613,14 @@ cont.matrix <- makeContrasts(Breast_IvsC = Breast.Circumscribed - Breast.Invasiv
                              Circum_BvsL = Lung.Circumscribed - Breast.Circumscribed,
                              Invasive_BvsL = Lung.Invasive - Breast.Invasive, 
                              levels=design)
+
+
+# cont.matrix <- makeContrasts(Breast_IvsC = Breast.Circumscribed - Breast.Invasive,
+#                              Lung_IvsC = Lung.Circumscribed - Lung.Invasive, 
+#                              levels=design)
+
+
+
 
 ## Invasive as baseline Circumscribed
 # cont.matrix <- makeContrasts(Breast_IvsC = Breast.Invasive - Breast.Circumscribed,
@@ -219,29 +669,48 @@ vennDiagram(results[,c(3,4)], include=c("up", "down"), circle.col = c("red", "bl
 ```{r}
 #vennDiagram(results[,5:6], include=c("up", "down"), circle.col = c("red", "blue", "green3", "pink"), show.include =T)
 
+# deg.table2 <- deg.table
+# deg.table <- deg.table2
+
+
+pval_th <- 0.2
+
 for(i in colnames(cont.matrix)){
   rm(deg)
   # i <- "Breast_IvsC"
-  deg=topTable(fit2, coef=i, number=100, sort.by = "P", resort.by = "logFC")
-  deg = deg %>% 
-    rownames_to_column('Genes') %>% 
-    #arrange(logFC) %>% 
-    filter(P.Value<0.05) %>% 
-    column_to_rownames('Genes') #%>% 
+  # i <- "Lung_IvsC"
+  deg <- as.data.frame(topTable(fit2, coef=i, number=Inf, sort.by = "P", 
+                                resort.by = "logFC", adjust.method = pval_ad_method) )
   
-  deg.table = rbind(deg.table, data.frame(Group = i, deg))
+  deg$Genes <- rownames(deg)
+  deg$Group <- i
+  rownames(deg) <- NULL
+  
+  # deg <- deg[ deg$P.Value < 0.05, ]
+  deg <- deg[ deg$adj.P.Val < pval_th, ]
+  
+  deg.table = rbind(deg.table, data.frame(deg))
+  
 }
 
+
+# rm(deg.table)
 # rm(design, fit, eseti, deg)
 
 deg.table$subGroup = factor(ifelse(deg.table$logFC>0, paste0(deg.table$Group,".up"),paste0(deg.table$Group,".down")))
 DEGlist = split(rownames(deg.table),deg.table$subGroup)
 DEGlist2 = split(rownames(deg.table),deg.table$Group)
 
+
+as.data.frame( table(deg.table$Group) )
+
+
+# ISG15
 deg.table1 <- as.data.frame(deg.table)
-
-deg.table1 <- deg.table1[ deg.table1$P.Value < 0.05, ]
-
+deg.table1$name <- rownames(deg.table1)
+# 
+# deg.table1 <- as.data.frame(deg)
+# deg.table1$name <- rownames(deg.table1)
 
 ```
 
@@ -251,43 +720,68 @@ deg.table1 <- deg.table1[ deg.table1$P.Value < 0.05, ]
 # 3.3 Heatmaps
 ```{r}
 print(summary(DEGlist)[,1, drop = F])
+
+#                                Length
+# Breast_IvsC.down               50    
+# Breast_IvsC.up                 50    
+# Circum_BvsL.down               57    
+# Circum_BvsL.up                 43    
+# Invasive_BvsL.down             62    
+# Invasive_BvsL.up               38    
+# Invasive_vs_Circumscribed.down  2    
+# Lung_IvsC.down                 49    
+# Lung_IvsC.up                   36    
+# Lung_vs_Breast.down             9    
+# Lung_vs_Breast.up               4    
+
+
+
+
+
+#                                Length
+# Breast_IvsC.down               50    
+# Breast_IvsC.up                 50    
+
+# Lung_IvsC.down                 49    
+# Lung_IvsC.up                   36    
+
 ```
 
 
 
 ```{r}
-colors <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(255)
-
-e = "eset.noMelanoma"
-eseti = get(e)
-  
-for(i in names(DEGlist2)){
-  
-  cat(paste0("\n\n## ", 'DEG: ', i,'\n\n'))
-  
-  rm(yfg, ggdata, hm.data)
-  yfg = DEGlist2[[i]]
-  if(length(yfg>0)){
-  
-  #heatmap
-  hm.data = data.frame(exprs(eseti))
-  hm.data = hm.data %>% #log2 %>%
-    subset(rownames(hm.data) %in% yfg)
-  hm.data = t(scale(t(hm.data), center = T, scale =T))
-  range <- max(abs(hm.data))
-  annot = pData(eseti)[,c('Primary_tumor', 'Growth_Pattern')]
-  
-  print(pheatmap(hm.data, main = paste0("DEGs: ", i), cluster_cols = T,
-           clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
-           col = colors, 
-           annotation_col = annot,
-           show_rownames = F, show_colnames = F, 
-           breaks = c(seq(range.default(hm.data)[1], -0.01, length.out = 255/2),
-                      seq(0.01, range.default(hm.data)[2], length.out = 255/2))
-           ))
-  
-  }
-}
+# colors <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(255)
+# 
+# e = "eset.noMelanoma"
+# eseti = get(e)
+#   
+# for(i in names(DEGlist2)){
+#   
+#   cat(paste0("\n\n## ", 'DEG: ', i,'\n\n'))
+#   
+#   rm(yfg, ggdata, hm.data)
+#   yfg = DEGlist2[[i]]
+#   if(length(yfg>0)){
+#   
+#   #heatmap
+#   hm.data = data.frame(exprs(eseti))
+#   hm.data = hm.data %>% #log2 %>%
+#     subset(rownames(hm.data) %in% yfg)
+#   hm.data = t(scale(t(hm.data), center = T, scale =T))
+#   range <- max(abs(hm.data))
+#   annot = pData(eseti)[,c('Primary_tumor', 'Growth_Pattern')]
+#   
+#   print(pheatmap(hm.data, main = paste0("DEGs: ", i), cluster_cols = T,
+#            clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
+#            col = colors, 
+#            annotation_col = annot,
+#            show_rownames = F, show_colnames = F, 
+#            breaks = c(seq(range.default(hm.data)[1], -0.01, length.out = 255/2),
+#                       seq(0.01, range.default(hm.data)[2], length.out = 255/2))
+#            ))
+#   
+#   }
+# }
 ```
 
 
@@ -521,6 +1015,22 @@ write.table( x = df[ ,c( "Gene_name", "logFC" ) ],
              file = lung_rank_file )
 
 Sys.setenv( LUNG_RANK_FILE = lung_rank_file )
+
+
+
+# ############################################################################# ##
+# this.coef <- "Invasive_vs_Circumscribed"
+# lung_rank_file <- paste0( outdir, "/rank_list_", this.coef, ".rnk" )
+# 
+# df <- topTable( fit = fit, coef = this.coef, number = Inf, sort.by = "logFC" )
+# df$Gene_name <- rownames( df )
+# df <- df[order(-df$logFC), ]
+# write.table( x = df[ ,c( "Gene_name", "logFC" ) ],
+#              sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE,
+#              file = lung_rank_file )
+# 
+# Sys.setenv( LUNG_RANK_FILE = lung_rank_file )
+
 
 ```
 

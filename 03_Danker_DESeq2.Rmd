@@ -1,0 +1,511 @@
+---
+title: "Rmarkdown_Danker_no.Melanoma_limma_ranked"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = getwd())
+
+library(ggrepel)
+library(ggplot2)
+library(fgsea)
+library(ComplexHeatmap)
+library(circlize)
+library(dplyr)
+library(ggpubr)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(reshape2)
+# library(outliers)
+# library(fitdistrplus)
+library(data.table)
+library(readgmt)
+library(DESeq2)
+source("./src/utils.R")
+
+
+####################################### Functions ########################### ##
+filters <- function(x){ length(x[x>5])>=2 }
+
+gm_mean <- function(x, na.rm=TRUE){ exp(sum(log(x[x>0]), na.rm=na.rm)/length(x)) }
+
+scaledata <- function(x){ return((x-min(x))/(max(x)-min(x))) }
+
+RowVar <- function(x, ...) { rowSums((x - rowMeans(x, ...))^2, ...)/(dim(x)[2] - 1) }
+
+RLE <- function(counts = counts){
+  # counts <- q3_counts
+  this.RLE <- as.matrix( log2( counts + 1 ) )
+  gene_medians <- rowMedians( this.RLE, useNames = FALSE )
+  return( this.RLE - gene_medians )
+}
+
+get_boxplot_stats <- function(vect){
+  return( boxplot.stats( vect, 
+                         coef = 1.5, do.conf = TRUE, do.out = TRUE)$stats )
+}
+
+get_boxplot_df <- function(mat){
+  
+  mat_boxplot <- as.data.frame(t( apply(X = mat, MARGIN = 2, FUN = get_boxplot_stats)))
+  colnames(mat_boxplot) <- c("q0", "q25", "q50", "q75", "q100")
+  mat_boxplot$sample <- rownames(mat_boxplot)
+  return(mat_boxplot)
+}
+
+# https://www.gsea-msigdb.org/gsea/msigdb/mouse/collections.jsp
+# list_of_gene_sets <- list(
+#    # MH: hallmark 50 gene sets
+#    hallmark = read_gmt( file = "./ref/h.all.v2023.2.Hs.symbols.gmt"),
+#    # Reactome subset of CP 1692 gene sets
+#    reactome = read_gmt( file = "./ref/c2.cp.reactome.v2023.2.Hs.symbols.gmt"),
+#    # Gene Ontologyu biological processes subset 7647 gene sets
+#    GO_BP = read_gmt( file = "./ref/c5.go.bp.v2023.2.Hs.symbols.gmt")
+#    )
+
+# MH: hallmark 50 gene sets
+list_of_gene_sets <- list( hallmark = read_gmt( file = "./ref/h.all.v2023.2.Hs.symbols.gmt") )
+
+
+outdir <- "./data/lung_and_breast_IvsC_invasive_as_baseline_18_03_24"
+dir.create( outdir, showWarnings = FALSE )
+
+```
+
+
+## Load data
+```{r}
+#################################### Load Ensembl info ###################### ##
+gene_info <- read.csv("./ref/Human_genes_GRCh38_p14_mart_export.tab", 
+                      header = TRUE, sep = "\t")
+
+gene_info <- gene_info[ gene_info$Chromosome.scaffold.name %in% c(1:22, "X", "Y", "MT"), ]
+
+gene_info$gene_length <- gene_info$Gene.end..bp. - gene_info$Gene.start..bp.
+
+tx2gene <- gene_info[, c("Transcript.stable.ID.version", "Gene.stable.ID.version")]
+
+
+gene_info <- gene_info[, c("Gene.stable.ID", "Gene.stable.ID.version", 
+                           "Gene.name", "Gene.description", "gene_length") ]
+
+gene_info <- gene_info[ ! duplicated(gene_info$Gene.stable.ID), ]
+
+gene_info[ gene_info$Gene.name == "", "Gene.name" ] <- 
+   gene_info[ gene_info$Gene.name == "", "Gene.stable.ID.version" ]
+
+gene_info$Gene.description <- gsub( " ", "_", gene_info$Gene.description )
+gene_info$Gene.description <- gsub( ",", "_", gene_info$Gene.description )
+gene_info$Gene.description <- gsub( "\t", "_", gene_info$Gene.description )
+
+
+################################### Load metadata ########################### ##
+
+pData <- read.table("./ref/samples_description.txt", row.names=1, header =T)
+pData$ROI <- factor(pData$ROI)
+pData$sample <- rownames(pData)
+pData$type <- paste0( pData$Primary_tumor, "_", pData$Growth_Pattern )
+
+pData$type <- as.factor(pData$type)
+pData$Primary_tumor <- as.factor(pData$Primary_tumor)
+pData$Growth_Pattern <- as.factor(pData$Growth_Pattern)
+
+
+################################## Read raw counts ########################## ##
+
+raw_counts <- as.data.frame( read.table('./ref/Step1_CTA_Initial_Dataset_Raw_counts_all.csv', 
+                                       header = T, sep = ',' ) )
+
+del_cols <- c("ProbeName", "TargetName", "HUGOSymbol", "Accessions", "GenomicPosition", 
+              "AnalyteType", "CodeClass", "ProbePool", "TargetGroup")
+
+raw_counts_mat <- raw_counts[ , -which(names(raw_counts) %in% del_cols) ]
+rownames(raw_counts_mat) <- raw_counts_mat$ProbeDisplayName
+raw_counts_mat <- raw_counts_mat[,-1]
+
+
+raw_counts_filtered <- raw_counts[ , colnames(raw_counts) != "TMA1_011" ]
+
+```
+
+
+
+## DESEq2 normalization
+```{r}
+######################### Convert wide to long format matrix ###################
+
+raw_counts_long <- melt( data = setDT( raw_counts_filtered ), 
+                         id.vars = c( "ProbeName", "ProbeDisplayName", "TargetName", 
+                                      "HUGOSymbol", "Accessions", "GenomicPosition", 
+                                      "AnalyteType", "CodeClass", "ProbePool", "TargetGroup" ), 
+              variable.name = "ROI" )
+
+colnames( raw_counts_long ) <- gsub( "^value$", "Count", colnames( raw_counts_long ) )
+
+
+############################# Taking gm_mean data ##############################
+data.gm <- raw_counts_long %>% 
+               group_by(ROI, TargetName) %>% 
+               summarize(Count = gm_mean(Count))
+
+LOQ_value <- 2  #For CTA we recommend 2.5 as a stringent threshold and 2.0 for a slightly permissive threshold.
+
+#calculate LOQ 
+LOQ <- raw_counts_long %>% 
+  filter(CodeClass == "Negative") %>% 
+  group_by(ROI) %>% 
+  summarize(gm_mean = gm_mean(Count), sd = sd(Count)) %>% 
+  mutate(LOQ = gm_mean+sd*LOQ_value)
+
+#calculate signal/noise ratio
+LOQ.vis <- data.gm %>% 
+               left_join(LOQ %>% dplyr::select(ROI, LOQ), by = "ROI") %>% 
+               mutate(ston = Count/LOQ)
+
+#names of probes that are below LOQ
+low.targets <- LOQ.vis %>%
+  group_by(TargetName) %>% 
+  summarize(test = any(ston>1)) %>% 
+  filter(test == F) %>% 
+  pull(TargetName)
+
+#filter results that are 100% below LOQ
+LOQ.res <- data.gm %>% 
+  filter(!TargetName %in% low.targets) %>% 
+  pivot_wider(values_from = Count, names_from = ROI) %>% 
+  column_to_rownames("TargetName") 
+
+
+####################### Normalization according to DESeq2 ######################
+
+deseqdat <- round(LOQ.res)
+rownames(pData) <- pData$sample
+
+pData <- pData[ pData$Included == "Include", ]
+
+deseqdat <- deseqdat[, colnames(deseqdat) %in% pData$sample]
+
+dds_all <- DESeqDataSetFromMatrix( countData = deseqdat,
+                                   colData   = pData,
+                                   design    = ~ 1 )
+
+## Extra filtering step
+dds_all <- estimateSizeFactors(dds_all)
+DESeq_dds_all <- DESeq(dds_all)
+```
+
+
+
+## PCA
+```{r}
+
+
+a <- counts(DESeq_dds_all, normalize=TRUE)
+a <- data.frame(a)
+
+a$names <- rownames(DESeq_dds_all)
+
+norm_counts_pca <- as.data.frame( assay(vst(DESeq_dds_all, blind=FALSE)) )
+
+############################################################## all samples #####
+
+# tmp_samples <- samples[ samples$Cell_Line == "Hs578-T", "sample_name"]
+tmp_samples <- pData$sample
+
+tmp_norm_counts <- norm_counts_pca[, tmp_samples]
+tmp_norm_counts <- tmp_norm_counts[ 0 < RowVar(tmp_norm_counts), ]
+
+norm_counts_dt <- t( tmp_norm_counts )
+norm_counts.pca <- prcomp( norm_counts_dt, scale = TRUE )
+
+#reverse the signs
+norm_counts.pca$rotation <- -1*norm_counts.pca$rotation
+
+#reverse the signs of the scores
+norm_counts.pca$x <- -1*norm_counts.pca$x
+
+#calculate total variance explained by each principal component
+vars <- norm_counts.pca$sdev^2 / sum(norm_counts.pca$sdev^2)
+
+pcs <- as.data.frame( norm_counts.pca$x )
+pcs$sample <- rownames( pcs )
+
+pcs <- merge( x = pData, y = pcs, by = "sample", all.x = TRUE )
+
+PCA <- ggplot( pcs, aes(PC1, PC2, label = sample, color = Primary_tumor, shape = Growth_Pattern )) +
+               geom_point(size=2) +
+               xlab(paste0("PC1 (", round( 100*vars[1], 2 ), "%)" )) +
+               ylab(paste0("PC2 (", round( 100*vars[2], 2 ), "%)"  )) +
+               ggtitle( paste0( "PCA - Polysome and RNA-seq samples" ) ) +
+               theme_light() +
+               geom_label_repel( size = 2, min.segment.length = 0, seed = 42 )
+
+ggsave( paste0( outdir, "/all_samples_PCA_DESeq2.pdf"), plot = PCA,
+        width = 11, height = 10 )
+```
+
+
+
+
+## DEA
+```{r}
+# contrast <- c(condition, treated_condition, reference_condition)
+source("./src/utils.R")
+options(ggrepel.max.overlaps = Inf)
+# ############################################################################# ##
+# samples_tmp <- pData[ pData$Primary_tumor == "Lung", ]
+# 
+# do_DEA_and_GSEA( comparison_id = "Lung_Invasive_vs_Circumscribed",
+#                  design = "~ type",
+#                  contrast = c("type", "Lung_Circumscribed", "Lung_Invasive"),
+#                  sample_df = samples_tmp,
+#                  count_df = deseqdat,
+#                  outdir = outdir )
+
+# ############################################################################ ##
+# samples_tmp <- pData[ pData$Primary_tumor == "Breast", ]
+# 
+# do_DEA_and_GSEA( comparison_id = "Breast_Invasive_vs_Circumscribed",
+#                  design = "~ type",
+#                  contrast = c("type", "Breast_Circumscribed", "Breast_Invasive"),
+#                  sample_df = samples_tmp,
+#                  count_df = deseqdat,
+#                  outdir = outdir )
+
+############################################################################# ##
+samples_tmp <- pData[ pData$Primary_tumor %in% c("Lung", "Breast"), ]
+
+do_DEA_and_GSEA( comparison_id = "Breast_and_Lung_Invasive_vs_Circumscribed",
+                 design = "~ Primary_tumor + Growth_Pattern",
+                 contrast = c("Growth_Pattern", "Circumscribed", "Invasive"),
+                 sample_df = samples_tmp,
+                 count_df = deseqdat,
+                 outdir = outdir )
+
+```
+
+
+
+## GSEA heatmap
+```{r}
+gsea_dir <- paste0(outdir, "/GSEA_summary")
+dir.create( path = gsea_dir, showWarnings = FALSE )
+
+gene_set_ref <- "hallmark"; ht_size <- c( 5,5)
+
+padj_th <- 0.1
+
+comparisons <- c( "Breast_and_Lung_Invasive_vs_Circumscribed",
+                  "Breast_Invasive_vs_Circumscribed",
+                  "Lung_Invasive_vs_Circumscribed")
+
+GSEA_df <- data.frame()
+
+for (comparison in comparisons) {
+   
+   # "pathway" "pval" "padj" "log2err" "ES" "NES" "size" "leadingEdge"
+   # comparison <- comparisons[1]
+   GSEA_res_path <- paste0( outdir, "/",comparison, "/GSEA_", 
+                            comparison, "_", gene_set_ref, "/", comparison, 
+                            "_", gene_set_ref, "_GSEA_results.csv" )
+   
+   GSEA_tmp_df <- read.csv( file = GSEA_res_path, header = TRUE )
+   GSEA_tmp_df$comparison <- comparison
+   GSEA_df <- rbind( GSEA_df, GSEA_tmp_df )
+   
+   }
+
+GSEA_df[ GSEA_df$padj > padj_th , "NES" ] <- 0
+
+
+GSEA_df <- GSEA_df[, c("pathway", "NES", "comparison") ]
+
+GSEA_df_wide <- reshape(GSEA_df, idvar = "pathway", timevar = "comparison", direction = "wide")
+rownames(GSEA_df_wide) <- GSEA_df_wide$pathway
+
+GSEA_df_wide[ is.na(GSEA_df_wide) ] <- 0
+
+
+GSEA_df_wide <- GSEA_df_wide[ rowSums( abs(GSEA_df_wide[,-1]) ) != 0  , ]
+
+## Only apoptosis related pathways
+# GSEA_df_wide <- GSEA_df_wide[ grepl("APOP", GSEA_df_wide$pathway), ]
+
+
+col_fun <- colorRamp2( c( -2, 0, 2 ), c( "blue", "white" ,"red" ) )
+
+
+pdf( paste0(gsea_dir, "/GSEA_NES_", gene_set_ref, "_summary_heatmap_padj_", padj_th, ".pdf" ),
+     width = ht_size[1], height = ht_size[2] )
+
+draw( ComplexHeatmap::Heatmap( as.matrix(t( GSEA_df_wide[,-1]) ),
+                               # column_title = paste0("Hallmark pathways as reference",
+                               #                       "\nadjusted p-value threshold: ",
+                               #                       padj_th),
+                               height = ncol(GSEA_df_wide[,-1])*unit(5, "mm"), 
+                               width = nrow(GSEA_df_wide[,-1])*unit(3, "mm"),
+                               cluster_rows = TRUE,
+                               cluster_columns = FALSE,
+                               show_row_names = TRUE,
+                               show_column_names = TRUE,
+                               col = col_fun,
+                               use_raster = FALSE,
+                               rect_gp = gpar(col = "black", lwd = 0.2),
+                               column_names_gp = gpar(fontsize = 6),
+                               row_names_gp = gpar(fontsize = 6),
+                               border = TRUE,
+                               name = " " ), 
+      heatmap_legend_side = "left",
+      column_title_gp = gpar(fontsize = 8),
+      column_title = paste0("Normalized enrichment score (NES)\n",
+                            gene_set_ref, " as gene set reference\n",
+                            "pathways with adj. p-value > ", padj_th, " shown as NES = 0" ) )
+dev.off()
+
+```
+
+
+
+
+## Pathway dotplots
+```{r}
+
+norm_counts <- as.data.frame( counts( DESeq_dds_all, normalized=TRUE ) )
+
+norm_counts$Gene.name <- rownames( norm_counts )
+
+pathways <-c("HALLMARK_INTERFERON_GAMMA_RESPONSE")
+
+for (pathway in pathways) {
+  
+  pathway <-"HALLMARK_INTERFERON_GAMMA_RESPONSE"
+  
+  dot_gsea_dir <- paste0( outdir, "/dotplots/dotplots_", pathway  )
+  dir.create( dot_gsea_dir, showWarnings = FALSE, recursive = TRUE )
+  
+  pathway_genes <- list_of_gene_sets[["hallmark"]][pathway][[1]]
+  
+  
+  pathway_counts <- norm_counts[ norm_counts$Gene.name %in% pathway_genes, ]
+  
+  pathway_counts <- pathway_counts[!duplicated(pathway_counts$Gene.name),]
+  
+  rownames(pathway_counts) <- pathway_counts$Gene.name
+  
+  pathway_counts <- pathway_counts[,colnames(pathway_counts) != "Gene.name"]
+  
+  
+  ################################ Write dotplots for the genes of interest ###
+   
+  pathway_counts <- data.frame( t( pathway_counts ) )
+  genes_in_pathway <- colnames( pathway_counts )
+  pathway_counts$sample <- rownames(pathway_counts)
+   
+   
+
+  tmp_counts_and_res <- merge( x = pData, y = pathway_counts, by = "sample" )
+  tmp_counts_and_res$Growth_Pattern <- factor(tmp_counts_and_res$Growth_Pattern, 
+                                              levels = c("Invasive", "Circumscribed") )
+  
+  
+   
+  tmp_counts_and_res <- tmp_counts_and_res[ tmp_counts_and_res$Primary_tumor %in% 
+                                              c("Lung", "Breast"), ]
+
+  for (gene_name in genes_in_pathway ) {
+    
+    # gene_name <- "B2M"
+    cat(paste0(gene_name, "\n"))
+
+    
+    
+    dea1 <- read.csv(file = paste0(outdir, 
+     "/Breast_and_Lung_Invasive_vs_Circumscribed/Breast_and_Lung_Invasive_vs_Circumscribed_DEG_by_DESeq2.csv"))
+    
+    LFC <- dea1[ dea1$Gene.name == gsub("\\.", "-", gene_name), "log2FoldChange"]
+    padj <- dea1[ dea1$Gene.name == gsub("\\.", "-", gene_name), "padj"]
+    
+    
+    this_title <- paste0( gene_name, " expression\n",
+                          "LFC = ", round(LFC, 2), "\nadjusted p-value = ", padj )
+
+    dotplot <- ggplot( tmp_counts_and_res,
+                      aes( x = Growth_Pattern, y = !!sym(gene_name), color = Primary_tumor, shape = Primary_tumor ) ) +
+    geom_jitter( width = 0.1 ) + ylab("Normalized counts") +
+    geom_text_repel( aes( label = sample ) ) +
+    scale_color_manual(values=c( "Lung" = "#9bcaff", "Breast" = "#fe9a9c" )) + 
+    theme_light() + ggtitle( this_title ) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+      NULL
+
+    ggsave( filename = paste0( dot_gsea_dir, "/", gene_name, "_", pathway, "_lung_and_breast_samples.pdf" ),
+           plot = dotplot, height = 7, width = 7 )
+  }
+  
+  
+  
+  tmp_counts_and_res <- tmp_counts_and_res[ tmp_counts_and_res$Primary_tumor %in% 
+                                              c("Lung"), ]
+
+  for (gene_name in genes_in_pathway ) {
+    
+    # gene_name <- "B2M"
+    cat(paste0(gene_name, "\n"))
+    
+    
+    
+    dea1 <- read.csv(file = paste0(outdir, 
+     "/Lung_Invasive_vs_Circumscribed/Lung_Invasive_vs_Circumscribed_DEG_by_DESeq2.csv"))
+    
+    LFC <- dea1[ dea1$Gene.name == gsub("\\.", "-", gene_name), "log2FoldChange"]
+    padj <- dea1[ dea1$Gene.name == gsub("\\.", "-", gene_name), "padj"]
+    
+    
+    this_title <- paste0( gene_name, " expression\n",
+                          "LFC = ", round(LFC, 2), "\nadjusted p-value = ", padj )
+
+
+    dotplot <- ggplot( tmp_counts_and_res,
+                      aes( x = Growth_Pattern, y = !!sym(gene_name), color = Primary_tumor, shape = Primary_tumor ) ) +
+    geom_jitter( width = 0.1 ) + ylab("Normalized counts") +
+    geom_text_repel( aes( label = sample ) ) +
+    scale_color_manual(values=c( "Lung" = "#9bcaff", "Breast" = "#fe9a9c" )) + 
+    theme_light() + ggtitle( this_title ) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    NULL
+
+    ggsave( filename = paste0( dot_gsea_dir, "/", gene_name, "_", pathway, "_only_lung_sample.pdf" ),
+           plot = dotplot, height = 7, width = 7 )
+  }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
